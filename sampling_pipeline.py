@@ -1,0 +1,683 @@
+"""
+Sampling and evaluation pipeline for the Adult Census Income dataset.
+
+The script implements the stratified + diversity-preserving sampling approach
+described in Step_2_Sampling_Algorithm_Design.docx and evaluates the downstream
+impact on a simple classifier compared to training on the full dataset.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Sequence
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from numpy.typing import NDArray
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+# Columns derived from Dataset Overview.docx (sensitive vs non-sensitive)
+SENSITIVE_COLUMNS = {
+    "education",
+    "education_num",
+    "marital_status",
+    "relationship",
+    "race",
+    "sex",
+    "native_country",
+}
+
+NON_SENSITIVE_COLUMNS = [
+    "age",
+    "workclass",
+    "fnlwgt",
+    "occupation",
+    "capital_gain",
+    "capital_loss",
+    "hours_per_week",
+]
+
+TARGET_COLUMN = "income"
+
+AGE_BIN_EDGES = [16, 25, 35, 50, 65, 80, 100]
+HOURS_BIN_EDGES = [0, 30, 40, 50, 60, 100]
+GAIN_BIN_EDGES = [-1, 0, 5000, 15000, 50000, 100000]
+LOSS_BIN_EDGES = [-1, 0, 2000, 4000, 10000]
+
+DIV_FINITE_FEATURES = [
+    "age",
+    "fnlwgt",
+    "capital_gain",
+    "capital_loss",
+    "hours_per_week",
+]
+
+
+def log_stage(stage: str, **stats: object) -> None:
+    """Print high-level stage markers with optional key/value stats."""
+    if stats:
+        parts = []
+        for key, value in stats.items():
+            if isinstance(value, float):
+                parts.append(f"{key}={value:.4f}")
+            else:
+                parts.append(f"{key}={value}")
+        detail = ", ".join(parts)
+        print(f"[Stage] {stage}: {detail}")
+    else:
+        print(f"[Stage] {stage}")
+
+
+@dataclass
+class SamplingReport:
+    sample_size: int
+    total_records: int
+    strata_kept: int
+    allocation_summary: pd.DataFrame
+    distribution_drift: pd.DataFrame
+    metrics_full: dict[str, float]
+    metrics_sample: dict[str, float]
+    classification_summary: str
+    used_full_training_set: bool = False
+
+
+def load_dataset(path: Path) -> pd.DataFrame:
+    """Load Adult CSV and normalize column names/values."""
+    df = pd.read_csv(path, skipinitialspace=True, na_values="?", encoding="utf-8")
+    df.columns = [
+        col.strip()
+        .lower()
+        .replace(".", "_")
+        .replace("-", "_")
+        .replace(" ", "_")
+        for col in df.columns
+    ]
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].str.strip()
+    df = df.replace("?", pd.NA)
+    return df
+
+
+def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace missing values with simple, privacy-preserving defaults."""
+    result = df.copy()
+    for col in result.columns:
+        if col == TARGET_COLUMN:
+            continue
+        if result[col].dtype == "O":
+            result[col] = result[col].fillna("Unknown")
+        else:
+            median = result[col].median()
+            result[col] = result[col].fillna(median)
+    return result
+
+
+def add_discretized_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add binned views of numeric features used for stratification."""
+    result = df.copy()
+    result["age_bin"] = pd.cut(
+        result["age"],
+        bins=AGE_BIN_EDGES,
+        labels=[
+            "17-25",
+            "26-35",
+            "36-50",
+            "51-65",
+            "66-80",
+            "81+",
+        ],
+        include_lowest=True,
+        right=True,
+    )
+    result["hours_bin"] = pd.cut(
+        result["hours_per_week"],
+        bins=HOURS_BIN_EDGES,
+        labels=["0-30", "31-40", "41-50", "51-60", "61+"],
+        include_lowest=True,
+        right=True,
+    )
+    result["gain_bin"] = pd.cut(
+        result["capital_gain"],
+        bins=GAIN_BIN_EDGES,
+        labels=["0", "1-5k", "5k-15k", "15k-50k", "50k+"],
+        include_lowest=True,
+        right=True,
+    )
+    result["loss_bin"] = pd.cut(
+        result["capital_loss"],
+        bins=LOSS_BIN_EDGES,
+        labels=["0", "1-2k", "2k-4k", "4k+"],
+        include_lowest=True,
+        right=True,
+    )
+    result["workclass"] = result["workclass"].fillna("Unknown")
+    result["occupation"] = result["occupation"].fillna("Unknown")
+    return result
+
+
+def dataframe_to_markdown(df: pd.DataFrame, **kwargs) -> str:
+    """Render DataFrame to markdown, falling back to plain text if needed."""
+    try:
+        return df.to_markdown(**kwargs)
+    except ImportError:
+        return df.to_string(index=kwargs.get("index", True))
+
+
+def _normalize_matrix(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Standardize columns and replace NaNs for diversity computation."""
+    col_means = np.nanmean(matrix, axis=0)
+    inds = np.where(np.isnan(matrix))
+    matrix[inds] = np.take(col_means, inds[1])
+    std = np.nanstd(matrix, axis=0)
+    std[std == 0.0] = 1.0
+    matrix = (matrix - col_means) / std
+    return np.nan_to_num(matrix)
+
+
+def _diversity_sample(
+    group: pd.DataFrame,
+    take: int,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """Select a subset that maximizes pairwise distances within a stratum."""
+    matrix = group[DIV_FINITE_FEATURES].to_numpy(dtype=float, copy=True)
+    matrix = _normalize_matrix(matrix)
+    if take <= 0:
+        return group.iloc[[]]
+    initial = int(rng.integers(0, len(group)))
+    chosen = [initial]
+    # Initialize squared distances from the first pivot
+    diff = matrix - matrix[initial]
+    min_dist = np.sum(diff * diff, axis=1)
+    min_dist[initial] = -np.inf
+    while len(chosen) < take:
+        next_idx = int(np.argmax(min_dist))
+        if min_dist[next_idx] <= 0:
+            # All points identical, fall back to random sampling
+            remaining = group.drop(index=group.index[chosen])
+            needed = take - len(chosen)
+            random_rows = remaining.sample(
+                n=needed,
+                random_state=int(rng.integers(0, 1_000_000)),
+            )
+            return pd.concat([group.iloc[chosen], random_rows])
+        chosen.append(next_idx)
+        diff = matrix - matrix[next_idx]
+        new_dist = np.sum(diff * diff, axis=1)
+        min_dist = np.minimum(min_dist, new_dist)
+        min_dist[chosen] = -np.inf
+    return group.iloc[chosen]
+
+
+def stratified_diversity_sample(
+    df: pd.DataFrame,
+    sample_size: int,
+    random_state: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Pick a representative sample from df using stratified proportional allocation
+    followed by intra-stratum diversity maximization.
+    Returns the sampled rows and a summary of the allocation.
+    """
+    if sample_size <= 0:
+        raise ValueError("Sample size must be positive.")
+    sample_size = min(sample_size, len(df))
+    rng = np.random.default_rng(random_state)
+    working = add_discretized_columns(df)
+    strata_cols = ["age_bin", "workclass", "occupation"]
+    grouped = working.groupby(strata_cols, dropna=False, observed=False)
+    group_sizes = grouped.size()
+    allocations = (group_sizes / len(working)) * sample_size
+    base = np.floor(allocations).astype(int)
+    remainders = allocations - base
+    assigned = int(base.sum())
+    leftover = sample_size - assigned
+    if leftover > 0:
+        for key in remainders.sort_values(ascending=False).index:
+            base.loc[key] += 1
+            leftover -= 1
+            if leftover == 0:
+                break
+    samples: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, object]] = []
+    for key, group in grouped:
+        take = int(base.get(key, 0))
+        group_len = len(group)
+        summary_rows.append(
+            {
+                "stratum": key,
+                "group_size": group_len,
+                "allocated_sample": min(take, group_len),
+            }
+        )
+        if take <= 0:
+            continue
+        take = min(take, group_len)
+        if take == group_len:
+            subset = group
+        elif take == 1 or group_len < 3:
+            subset = group.sample(
+                n=take,
+                random_state=int(rng.integers(0, 1_000_000)),
+            )
+        else:
+            subset = _diversity_sample(group, take, rng)
+        samples.append(subset)
+    if not samples:
+        raise ValueError("Sampling produced no strata. Check input data.")
+    sampled = pd.concat(samples).drop(columns=["age_bin", "hours_bin", "gain_bin", "loss_bin"])
+    sampled = sampled.loc[~sampled.index.duplicated(keep="first")]
+    if len(sampled) < sample_size:
+        remaining = df.drop(index=sampled.index)
+        needed = sample_size - len(sampled)
+        fallback = remaining.sample(
+            n=needed,
+            random_state=int(rng.integers(0, 1_000_000)),
+        )
+        sampled = pd.concat([sampled, fallback])
+    sampled = sampled.sample(
+        n=sample_size,
+        random_state=int(rng.integers(0, 1_000_000)),
+        replace=False,
+    )
+    allocation_summary = pd.DataFrame(summary_rows)
+    return sampled, allocation_summary
+
+
+def build_pipeline(features: Sequence[str]) -> Pipeline:
+    """Construct a preprocessing + logistic regression pipeline."""
+    categorical = [col for col in features if col not in DIV_FINITE_FEATURES]
+    numeric = [col for col in features if col in DIV_FINITE_FEATURES]
+    transformers = []
+    if numeric:
+        transformers.append(
+            (
+                "num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                numeric,
+            )
+        )
+    if categorical:
+        transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "encoder",
+                            OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                        ),
+                    ]
+                ),
+                categorical,
+            )
+        )
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    clf = LogisticRegression(
+        max_iter=500,
+        n_jobs=None,
+        solver="lbfgs",
+    )
+    return Pipeline(steps=[("preprocessor", preprocessor), ("model", clf)])
+
+
+def evaluate_models(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    sample_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+) -> tuple[dict[str, float], dict[str, float], str]:
+    """Fit and compare classifiers trained on the full vs sampled data."""
+    pipeline = build_pipeline(feature_cols)
+    full_model = pipeline.fit(train_df[feature_cols], train_df[TARGET_COLUMN])
+    sample_model = clone(pipeline).fit(sample_df[feature_cols], sample_df[TARGET_COLUMN])
+    X_test = test_df[feature_cols]
+    y_test = test_df[TARGET_COLUMN]
+    proba_full = full_model.predict_proba(X_test)[:, 1]
+    proba_sample = sample_model.predict_proba(X_test)[:, 1]
+    y_pred_full = (proba_full >= 0.5).astype(int)
+    y_pred_sample = (proba_sample >= 0.5).astype(int)
+    y_test_binary = (y_test == ">50K").astype(int)
+    metrics_full = {
+        "accuracy": accuracy_score(y_test, full_model.predict(X_test)),
+        "precision": precision_score(y_test_binary, y_pred_full),
+        "recall": recall_score(y_test_binary, y_pred_full),
+        "f1": f1_score(y_test_binary, y_pred_full),
+        "roc_auc": roc_auc_score(y_test_binary, proba_full),
+    }
+    metrics_sample = {
+        "accuracy": accuracy_score(y_test, sample_model.predict(X_test)),
+        "precision": precision_score(y_test_binary, y_pred_sample),
+        "recall": recall_score(y_test_binary, y_pred_sample),
+        "f1": f1_score(y_test_binary, y_pred_sample),
+        "roc_auc": roc_auc_score(y_test_binary, proba_sample),
+    }
+    class_report = classification_report(
+        y_test,
+        sample_model.predict(X_test),
+        digits=3,
+    )
+    return metrics_full, metrics_sample, class_report
+
+
+def feature_distribution_drift(
+    full_df: pd.DataFrame,
+    sample_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute total variation distance for each non-sensitive column."""
+    rows = []
+    for col in NON_SENSITIVE_COLUMNS:
+        full_series = full_df[col]
+        sample_series = sample_df[col]
+        if pd.api.types.is_numeric_dtype(full_series):
+            bins = 10
+            full_hist, bin_edges = np.histogram(full_series, bins=bins, density=True)
+            sample_hist, _ = np.histogram(sample_series, bins=bin_edges, density=True)
+            # Normalize histograms to proper distributions
+            full_hist = full_hist / full_hist.sum()
+            sample_hist = sample_hist / sample_hist.sum()
+        else:
+            full_counts = full_series.value_counts(normalize=True)
+            sample_counts = sample_series.value_counts(normalize=True)
+            union = full_counts.index.union(sample_counts.index)
+            full_hist = full_counts.reindex(union, fill_value=0).to_numpy()
+            sample_hist = sample_counts.reindex(union, fill_value=0).to_numpy()
+        tv_distance = 0.5 * np.abs(full_hist - sample_hist).sum()
+        rows.append({"feature": col, "total_variation": tv_distance})
+    return pd.DataFrame(rows).sort_values("total_variation")
+
+
+def _plot_numeric_distribution(
+    full_series: pd.Series,
+    sample_series: pd.Series,
+    column: str,
+    output_dir: Path,
+) -> Path:
+    bins = min(20, max(5, full_series.nunique()))
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(
+        full_series,
+        bins=bins,
+        alpha=0.6,
+        density=True,
+        label="Original",
+        color="#1f77b4",
+    )
+    ax.hist(
+        sample_series,
+        bins=bins,
+        alpha=0.6,
+        density=True,
+        label="Sample",
+        color="#ff7f0e",
+    )
+    ax.set_xlabel(column)
+    ax.set_ylabel("Density")
+    ax.set_title(f"{column} distribution")
+    ax.legend()
+    fig.tight_layout()
+    path = output_dir / f"{column}_distribution.png"
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    return path
+
+
+def _plot_categorical_distribution(
+    full_series: pd.Series,
+    sample_series: pd.Series,
+    column: str,
+    output_dir: Path,
+) -> Path:
+    full_counts = full_series.value_counts(normalize=True)
+    sample_counts = sample_series.value_counts(normalize=True)
+    categories = full_counts.index.union(sample_counts.index)
+    full_values = full_counts.reindex(categories, fill_value=0).to_numpy()
+    sample_values = sample_counts.reindex(categories, fill_value=0).to_numpy()
+    positions = np.arange(len(categories))
+    width = 0.4
+    fig, ax = plt.subplots(figsize=(max(8, len(categories) * 0.5), 4))
+    ax.bar(
+        positions - width / 2,
+        full_values,
+        width,
+        label="Original",
+        color="#1f77b4",
+    )
+    ax.bar(
+        positions + width / 2,
+        sample_values,
+        width,
+        label="Sample",
+        color="#ff7f0e",
+    )
+    ax.set_xticks(positions)
+    ax.set_xticklabels([str(cat) for cat in categories], rotation=45, ha="right")
+    ax.set_ylabel("Proportion")
+    ax.set_title(f"{column} distribution")
+    ax.legend()
+    fig.tight_layout()
+    path = output_dir / f"{column}_distribution.png"
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    return path
+
+
+def create_distribution_plots(
+    full_df: pd.DataFrame,
+    sample_df: pd.DataFrame,
+    columns: Sequence[str],
+    output_dir: Path,
+) -> list[Path]:
+    """Generate histogram/bar comparisons for selected columns."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generated_paths: list[Path] = []
+    for column in columns:
+        if column not in full_df.columns or column not in sample_df.columns:
+            continue
+        full_series = full_df[column].dropna()
+        sample_series = sample_df[column].dropna()
+        if pd.api.types.is_numeric_dtype(full_series):
+            path = _plot_numeric_distribution(full_series, sample_series, column, output_dir)
+        else:
+            path = _plot_categorical_distribution(full_series, sample_series, column, output_dir)
+        generated_paths.append(path)
+    return generated_paths
+
+
+def run_pipeline(
+    data_path: Path,
+    sample_size: Optional[int],
+    random_state: int,
+) -> tuple[SamplingReport, pd.DataFrame, pd.DataFrame]:
+    log_stage("Loading dataset", path=data_path)
+    df = load_dataset(data_path)
+    df = fill_missing_values(df)
+    log_stage("Dataset ready", total_records=len(df))
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"Target column '{TARGET_COLUMN}' missing from dataset.")
+    features = [col for col in NON_SENSITIVE_COLUMNS if col in df.columns]
+    train_df, test_df = train_test_split(
+        df,
+        test_size=0.2,
+        stratify=df[TARGET_COLUMN],
+        random_state=random_state,
+    )
+    log_stage("Split dataset", train=len(train_df), test=len(test_df))
+    if sample_size is None or sample_size <= 0:
+        effective_sample_size = len(train_df)
+    else:
+        effective_sample_size = min(sample_size, len(train_df))
+    sampled_df, allocation_summary = stratified_diversity_sample(
+        train_df,
+        sample_size=effective_sample_size,
+        random_state=random_state,
+    )
+    strata_kept = allocation_summary["allocated_sample"].astype(bool).sum()
+    log_stage(
+        "Sampling completed",
+        sample_size=len(sampled_df),
+        strata=strata_kept,
+        coverage=len(sampled_df) / len(train_df),
+    )
+    metrics_full, metrics_sample, class_report = evaluate_models(
+        train_df,
+        test_df,
+        sampled_df,
+        features,
+    )
+    log_stage(
+        "Evaluation complete",
+        sample_accuracy=metrics_sample["accuracy"],
+        sample_roc_auc=metrics_sample["roc_auc"],
+    )
+    drift = feature_distribution_drift(train_df, sampled_df)
+    log_stage(
+        "Distribution drift computed",
+        max_drift=float(drift["total_variation"].max()),
+        min_drift=float(drift["total_variation"].min()),
+    )
+    report = SamplingReport(
+        sample_size=len(sampled_df),
+        total_records=len(df),
+        strata_kept=strata_kept,
+        allocation_summary=allocation_summary,
+        distribution_drift=drift,
+        metrics_full=metrics_full,
+        metrics_sample=metrics_sample,
+        classification_summary=class_report,
+        used_full_training_set=(effective_sample_size == len(train_df)),
+    )
+    return report, sampled_df, train_df
+
+
+def write_report(report: SamplingReport, output_path: Path) -> None:
+    """Persist a human-readable summary."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_note = " (full training set)" if report.used_full_training_set else ""
+    lines = [
+        "# Sampling Report",
+        "",
+        f"- Total records: {report.total_records}",
+        f"- Sample size: {report.sample_size}{sample_note}",
+        f"- Non-empty strata: {report.strata_kept}",
+        "",
+        "## Model Performance (Full vs Sample)",
+    ]
+    header = "| Metric | Full Data | Sample |\n| --- | --- | --- |"
+    lines.append(header)
+    for metric in ["accuracy", "precision", "recall", "f1", "roc_auc"]:
+        full_val = report.metrics_full.get(metric, float("nan"))
+        sample_val = report.metrics_sample.get(metric, float("nan"))
+        lines.append(f"| {metric} | {full_val:.3f} | {sample_val:.3f} |")
+    lines.extend(
+        [
+            "",
+            "## Distribution Drift (Total Variation Distance)",
+            dataframe_to_markdown(report.distribution_drift, index=False),
+            "",
+            "## Strata Allocation (top 15 by size)",
+            dataframe_to_markdown(
+                report.allocation_summary.sort_values("group_size", ascending=False)
+                .head(15),
+                index=False,
+            ),
+            "",
+            "## Sample Classification Report",
+            "```\n" + report.classification_summary + "\n```",
+        ]
+    )
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Representative sampling + evaluation for Adult dataset.",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=Path("adult.csv"),
+        help="Path to adult.csv dataset.",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Number of records to sample (m). Omit or <=0 to keep the full training set.",
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed used across sampling/modeling.",
+    )
+    parser.add_argument(
+        "--report-path",
+        type=Path,
+        default=Path("sampling_report.md"),
+        help="Where to save the markdown report.",
+    )
+    parser.add_argument(
+        "--export-sample",
+        type=Path,
+        default=Path("sampled_adult.csv"),
+        help="Optional CSV path to persist the sampled records.",
+    )
+    parser.add_argument(
+        "--figures-dir",
+        type=Path,
+        default=Path("figures"),
+        help="Directory for distribution comparison figures.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    report, sampled_df, reference_df = run_pipeline(
+        data_path=args.data_path,
+        sample_size=args.sample_size,
+        random_state=args.random_state,
+    )
+    write_report(report, args.report_path)
+    log_stage("Report written", path=args.report_path)
+    if args.export_sample:
+        args.export_sample.parent.mkdir(parents=True, exist_ok=True)
+        sampled_df.to_csv(args.export_sample, index=False)
+        log_stage("Sample CSV exported", path=args.export_sample, rows=len(sampled_df))
+    generated = create_distribution_plots(
+        reference_df,
+        sampled_df,
+        columns=["age", "workclass", "occupation"],
+        output_dir=args.figures_dir,
+    )
+    if generated:
+        log_stage("Figures generated", count=len(generated), directory=args.figures_dir)
+
+
+if __name__ == "__main__":
+    main()
