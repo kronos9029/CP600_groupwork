@@ -41,6 +41,15 @@ hours_per_week              0.0
 (36-50, Private, Machine-op-inspct)         571               571
     (26-35, Private, Other-service)         553               553
 
+## Complexity Snapshot
+| Component | Complexity |
+| --- | --- |
+| Overall | O(n*d) |
+| Discretization | O(n*d) |
+| Grouping | O(n) |
+| Sampling | O(m*d) |
+| Space | O(n + m) |
+
 ## Sample Classification Report
 ```
               precision    recall  f1-score   support

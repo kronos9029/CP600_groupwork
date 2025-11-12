@@ -70,6 +70,14 @@ DIV_FINITE_FEATURES = [
     "hours_per_week",
 ]
 
+COMPLEXITY_INFO = {
+    "end_to_end": "O(n*d)",  # n rows, d non-sensitive features
+    "discretization": "O(n*d)",
+    "grouping": "O(n)",
+    "sampling": "O(m*d)",
+    "space": "O(n + m)",
+}
+
 
 def log_stage(stage: str, **stats: object) -> None:
     """Print high-level stage markers with optional key/value stats."""
@@ -560,6 +568,11 @@ def run_pipeline(
         max_drift=float(drift["total_variation"].max()),
         min_drift=float(drift["total_variation"].min()),
     )
+    log_stage(
+        "Complexity reference",
+        overall=COMPLEXITY_INFO["end_to_end"],
+        space=COMPLEXITY_INFO["space"],
+    )
     report = SamplingReport(
         sample_size=len(sampled_df),
         total_records=len(df),
@@ -605,6 +618,15 @@ def write_report(report: SamplingReport, output_path: Path) -> None:
                 .head(15),
                 index=False,
             ),
+            "",
+            "## Complexity Snapshot",
+            "| Component | Complexity |",
+            "| --- | --- |",
+            f"| Overall | {COMPLEXITY_INFO['end_to_end']} |",
+            f"| Discretization | {COMPLEXITY_INFO['discretization']} |",
+            f"| Grouping | {COMPLEXITY_INFO['grouping']} |",
+            f"| Sampling | {COMPLEXITY_INFO['sampling']} |",
+            f"| Space | {COMPLEXITY_INFO['space']} |",
             "",
             "## Sample Classification Report",
             "```\n" + report.classification_summary + "\n```",
@@ -672,7 +694,14 @@ def main() -> None:
     generated = create_distribution_plots(
         reference_df,
         sampled_df,
-        columns=["age", "workclass", "occupation"],
+        columns=[
+            "age",
+            "workclass",
+            "occupation",
+            "hours_per_week",
+            "capital_gain",
+            "capital_loss",
+        ],
         output_dir=args.figures_dir,
     )
     if generated:
