@@ -57,6 +57,8 @@ NON_SENSITIVE_COLUMNS = [
 
 TARGET_COLUMN = "income"
 
+DEFAULT_SAMPLE_SIZE = 10000
+
 AGE_BIN_EDGES = [16, 25, 35, 50, 65, 80, 100]
 HOURS_BIN_EDGES = [0, 30, 40, 50, 60, 100]
 GAIN_BIN_EDGES = [-1, 0, 5000, 15000, 50000, 100000]
@@ -536,7 +538,7 @@ def run_pipeline(
     )
     log_stage("Split dataset", train=len(train_df), test=len(test_df))
     if sample_size is None or sample_size <= 0:
-        effective_sample_size = len(train_df)
+        effective_sample_size = min(DEFAULT_SAMPLE_SIZE, len(train_df))
     else:
         effective_sample_size = min(sample_size, len(train_df))
     sampled_df, allocation_summary = stratified_diversity_sample(
@@ -648,8 +650,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample-size",
         type=int,
-        default=None,
-        help="Number of records to sample (m). Omit or <=0 to keep the full training set.",
+        default=DEFAULT_SAMPLE_SIZE,
+        help=f"Number of records to sample (m). Omit or <=0 to fall back to {DEFAULT_SAMPLE_SIZE}.",
     )
     parser.add_argument(
         "--random-state",
