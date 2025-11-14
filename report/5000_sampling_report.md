@@ -2,6 +2,7 @@
 
 - Total records: 32561
 - Sample size: 5000
+- Membership MI (bits): 0.3984
 - Non-empty strata: 294
 
 ## Model Performance (Full vs Sample)

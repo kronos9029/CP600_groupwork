@@ -57,7 +57,7 @@ NON_SENSITIVE_COLUMNS = [
 
 TARGET_COLUMN = "income"
 
-DEFAULT_SAMPLE_SIZE = 10000
+DEFAULT_SAMPLE_SIZE = 0
 
 AGE_BIN_EDGES = [16, 25, 35, 50, 65, 80, 100]
 HOURS_BIN_EDGES = [0, 30, 40, 50, 60, 100]
@@ -107,6 +107,7 @@ class SamplingReport:
     metrics_sample: dict[str, float]
     classification_summary: str
     used_full_training_set: bool = False
+    membership_mi: float = float("nan")
 
 
 def load_dataset(path: Path) -> pd.DataFrame:
@@ -421,6 +422,69 @@ def feature_distribution_drift(
     return pd.DataFrame(rows).sort_values("total_variation")
 
 
+def _add_fnlwgt_bins(df: pd.DataFrame, bins: int = 10) -> pd.Series:
+    """Create discrete bins for fnlwgt to enable MI calculation."""
+    try:
+        return pd.qcut(df["fnlwgt"], q=bins, labels=False, duplicates="drop")
+    except ValueError:
+        return pd.cut(df["fnlwgt"], bins=bins, labels=False, include_lowest=True)
+
+
+def _estimate_membership_mi(
+    df: pd.DataFrame,
+    sampled_indices: Sequence[int],
+) -> float:
+    """Estimate I(X; I) where I indicates membership in the sampled subset."""
+    discrete = add_discretized_columns(df)
+    discrete["fnlwgt_bin"] = _add_fnlwgt_bins(discrete).astype("Int64")
+    discrete["in_sample"] = 0
+    intersect = discrete.index.intersection(sampled_indices)
+    discrete.loc[intersect, "in_sample"] = 1
+    mi_columns = [
+        "age_bin",
+        "workclass",
+        "occupation",
+        "fnlwgt_bin",
+        "hours_bin",
+        "gain_bin",
+        "loss_bin",
+    ]
+    for column in mi_columns:
+        discrete[column] = discrete[column].astype(str)
+    return _mutual_information_discrete(discrete, mi_columns, "in_sample")
+
+
+def _mutual_information_discrete(
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    membership_col: str,
+) -> float:
+    """Compute mutual information between feature tuple and membership flag."""
+    total = len(df)
+    if total == 0:
+        return 0.0
+    joint = (
+        df.groupby(list(feature_cols) + [membership_col], dropna=False)
+        .size()
+        .div(total)
+    )
+    p_x = df.groupby(feature_cols, dropna=False).size().div(total)
+    p_i = df.groupby(membership_col, dropna=False).size().div(total)
+    mi = 0.0
+    for key, p_xi in joint.items():
+        x_key = key[:-1]
+        i_value = key[-1]
+        p_x_val = p_x[x_key]
+        p_i_val = p_i[i_value]
+        if p_xi == 0 or p_x_val == 0 or p_i_val == 0:
+            continue
+        ratio = p_xi / (p_x_val * p_i_val)
+        if ratio <= 0:
+            continue
+        mi += p_xi * math.log2(ratio)
+    return float(mi)
+
+
 def _plot_numeric_distribution(
     full_series: pd.Series,
     sample_series: pd.Series,
@@ -538,7 +602,7 @@ def run_pipeline(
     )
     log_stage("Split dataset", train=len(train_df), test=len(test_df))
     if sample_size is None or sample_size <= 0:
-        effective_sample_size = min(DEFAULT_SAMPLE_SIZE, len(train_df))
+        effective_sample_size = len(train_df)
     else:
         effective_sample_size = min(sample_size, len(train_df))
     sampled_df, allocation_summary = stratified_diversity_sample(
@@ -553,6 +617,8 @@ def run_pipeline(
         strata=strata_kept,
         coverage=len(sampled_df) / len(train_df),
     )
+    membership_mi = _estimate_membership_mi(train_df, sampled_df.index)
+    log_stage("Membership MI estimated", bits=membership_mi)
     metrics_full, metrics_sample, class_report = evaluate_models(
         train_df,
         test_df,
@@ -585,6 +651,7 @@ def run_pipeline(
         metrics_sample=metrics_sample,
         classification_summary=class_report,
         used_full_training_set=(effective_sample_size == len(train_df)),
+        membership_mi=membership_mi,
     )
     return report, sampled_df, train_df
 
@@ -598,6 +665,7 @@ def write_report(report: SamplingReport, output_path: Path) -> None:
         "",
         f"- Total records: {report.total_records}",
         f"- Sample size: {report.sample_size}{sample_note}",
+        f"- Membership MI (bits): {report.membership_mi:.4f}",
         f"- Non-empty strata: {report.strata_kept}",
         "",
         "## Model Performance (Full vs Sample)",
@@ -651,7 +719,7 @@ def parse_args() -> argparse.Namespace:
         "--sample-size",
         type=int,
         default=DEFAULT_SAMPLE_SIZE,
-        help=f"Number of records to sample (m). Omit or <=0 to fall back to {DEFAULT_SAMPLE_SIZE}.",
+        help="Number of records to sample (m). Omit or <=0 to keep the full training set.",
     )
     parser.add_argument(
         "--random-state",
