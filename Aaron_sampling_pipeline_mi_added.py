@@ -1,9 +1,19 @@
 """
 Sampling and evaluation pipeline for the Adult Census Income dataset.
 
-The script implements the stratified + diversity-preserving sampling approach
-described in Step_2_Sampling_Algorithm_Design.docx and evaluates the downstream
-impact on a simple classifier compared to training on the full dataset.
+Extended to include an MI-aware sampling method that aims to minimize
+mutual information between the sampled membership indicator and the
+non-sensitive attributes by matching the sample joint distribution to
+that of the original dataset (proportional allocation over discrete
+feature-tuples).
+
+Two sampling methods are now available:
+ - "diversity" (original stratified + diversity sampler)
+ - "mi_proportional" (new proportional allocation across discrete
+    tuples of non-sensitive attributes; efficient and designed to
+    reduce I(X;I) by matching p(x|I=1) to p(x)).
+
+Usage: run the script with --sampling-method {diversity,mi_proportional}
 """
 
 from __future__ import annotations
@@ -76,7 +86,7 @@ COMPLEXITY_INFO = {
     "end_to_end": "O(n*d)",  # n rows, d non-sensitive features
     "discretization": "O(n*d)",
     "grouping": "O(n)",
-    "sampling": "O(m*d)",
+    "sampling": "O(n)",
     "space": "O(n + m)",
 }
 
@@ -313,6 +323,128 @@ def stratified_diversity_sample(
     return sampled, allocation_summary
 
 
+# ---- NEW: MI-proportional sampling (efficient heuristic to reduce I(X;I)) ----
+def mi_proportional_sample(
+    df: pd.DataFrame,
+    sample_size: int,
+    random_state: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Create a sample that matches the joint empirical distribution over a set
+    of discretized non-sensitive features. This minimizes dependence between
+    membership and X in the sense that p(x | in_sample) ~= p(x) when the
+    allocation is exact.
+
+    Procedure (efficient):
+    - Discretize the relevant features used in MI estimation.
+    - Treat each unique tuple of those features as a "micro-stratum".
+    - Allocate sample counts proportionally to their frequency (floor + largest
+      remainder tie-breaking). Then randomly choose that many rows from each
+      tuple (without replacement).
+
+    Complexity: O(n) to build counts and O(r) to allocate and sample where r
+    is the number of unique tuples (r <= n).
+    """
+    if sample_size <= 0:
+        raise ValueError("Sample size must be positive.")
+    sample_size = min(sample_size, len(df))
+    rng = np.random.default_rng(random_state)
+
+    working = add_discretized_columns(df)
+    # columns used for MI in the rest of the script
+    mi_columns = [
+        "age_bin",
+        "workclass",
+        "occupation",
+        "fnlwgt",
+        "hours_bin",
+        "gain_bin",
+        "loss_bin",
+    ]
+    # Create a tuple key representing the joint state. Note: fnlwgt will be
+    # binned separately to limit table size; reuse existing helper.
+    working = working.copy()
+    working["fnlwgt_bin"] = _add_fnlwgt_bins(working).astype("Int64")
+    # Use string keys to support groupby reliably (including NaN categories)
+    def make_key(row: pd.Series) -> str:
+        parts = []
+        parts.append(str(row["age_bin"]))
+        parts.append(str(row["workclass"]))
+        parts.append(str(row["occupation"]))
+        parts.append(str(row["fnlwgt_bin"]))
+        parts.append(str(row["hours_bin"]))
+        parts.append(str(row["gain_bin"]))
+        parts.append(str(row["loss_bin"]))
+        return "||".join(parts)
+
+    keys = working.apply(make_key, axis=1)
+    working = working.assign(_tuple_key=keys)
+
+    counts = working["_tuple_key"].value_counts(sort=False)
+    n = len(working)
+    # proportional allocation
+    allocations = (counts / n) * sample_size
+    base = allocations.astype(int)
+    remainders = allocations - base
+
+    assigned = int(base.sum())
+    leftover = sample_size - assigned
+    # largest fractional remainders first
+    if leftover > 0:
+        for key in remainders.sort_values(ascending=False).index:
+            base.loc[key] += 1
+            leftover -= 1
+            if leftover == 0:
+                break
+
+    sampled_parts: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, object]] = []
+    # For each micro-stratum, sample the allocated number of rows
+    for key, alloc in base.items():
+        group_idx = working.index[working["_tuple_key"] == key]
+        group_size = len(group_idx)
+        take = int(min(alloc, group_size))
+        summary_rows.append({"tuple_key": key, "group_size": group_size, "allocated": take})
+        if take <= 0:
+            continue
+        chosen = working.loc[group_idx].sample(n=take, random_state=int(rng.integers(0, 1_000_000)))
+        sampled_parts.append(chosen)
+
+    if sampled_parts:
+        sampled = pd.concat(sampled_parts)
+    else:
+        sampled = df.iloc[[]]
+
+    # If rounding left us short for any reason, fill from remaining uniformly
+    if len(sampled) < sample_size:
+        remaining = df.drop(index=sampled.index)
+        needed = sample_size - len(sampled)
+        if needed > 0:
+            fallback = remaining.sample(n=needed, random_state=int(rng.integers(0, 1_000_000)))
+            sampled = pd.concat([sampled, fallback])
+
+    sampled = sampled.sample(n=sample_size, random_state=int(rng.integers(0, 1_000_000)))
+
+    allocation_summary = pd.DataFrame(summary_rows)
+    # drop helper columns before returning
+    sampled = sampled.drop(columns=[c for c in ["age_bin", "hours_bin", "gain_bin", "loss_bin", "_tuple_key", "fnlwgt_bin"] if c in sampled.columns], errors="ignore")
+    return sampled, allocation_summary
+
+
+def stratified_or_mi_sample(
+    df: pd.DataFrame,
+    sample_size: int,
+    random_state: int,
+    method: str = "diversity",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if method == "diversity":
+        return stratified_diversity_sample(df, sample_size, random_state)
+    elif method == "mi_proportional":
+        return mi_proportional_sample(df, sample_size, random_state)
+    else:
+        raise ValueError(f"Unknown sampling method: {method}")
+
+
 def build_pipeline(features: Sequence[str]) -> Pipeline:
     """Construct a preprocessing + logistic regression pipeline."""
     categorical = [col for col in features if col not in DIV_FINITE_FEATURES]
@@ -485,62 +617,6 @@ def _mutual_information_discrete(
     return float(mi)
 
 
-def mi_guided_refinement(
-    full_df: pd.DataFrame,
-    initial_sample: pd.DataFrame,
-    random_state: int,
-    max_iter: int = 30,
-) -> tuple[pd.DataFrame, float]:
-    """
-    Iteratively swap records within strata to directly minimize membership MI.
-    """
-    rng = np.random.default_rng(random_state)
-    if initial_sample.empty:
-        return initial_sample, 0.0
-    discretized = add_discretized_columns(full_df)
-    strata_cols = ["age_bin", "workclass", "occupation"]
-    discretized["stratum_key"] = (
-        discretized[strata_cols].astype(str).agg("|".join, axis=1)
-    )
-    stratum_groups = {
-        key: set(group.index.tolist())
-        for key, group in discretized.groupby("stratum_key", dropna=False)
-    }
-    selected: set[int] = set(map(int, initial_sample.index.tolist()))
-    best_indices = list(selected)
-    best_mi = _estimate_membership_mi(full_df, best_indices)
-    for _ in range(max_iter):
-        eligible = [
-            key
-            for key, idxs in stratum_groups.items()
-            if len(selected & idxs) > 0 and len(idxs - selected) > 0
-        ]
-        if not eligible:
-            break
-        key = eligible[int(rng.integers(0, len(eligible)))]
-        stratum_selected = list(selected & stratum_groups[key])
-        stratum_candidates = list(stratum_groups[key] - selected)
-        if not stratum_selected or not stratum_candidates:
-            continue
-        to_remove = stratum_selected[int(rng.integers(0, len(stratum_selected)))]
-        to_add = stratum_candidates[int(rng.integers(0, len(stratum_candidates)))]
-        trial_selected = set(selected)
-        trial_selected.remove(to_remove)
-        trial_selected.add(to_add)
-        trial_indices = list(trial_selected)
-        trial_mi = _estimate_membership_mi(full_df, trial_indices)
-        if trial_mi + 1e-6 < best_mi:
-            selected = trial_selected
-            best_indices = trial_indices
-            best_mi = trial_mi
-    refined_df = full_df.loc[best_indices].copy()
-    refined_df = refined_df.sample(
-        frac=1,
-        random_state=int(rng.integers(0, 1_000_000)),
-    )
-    return refined_df, best_mi
-
-
 def _plot_numeric_distribution(
     full_series: pd.Series,
     sample_series: pd.Series,
@@ -642,6 +718,7 @@ def run_pipeline(
     data_path: Path,
     sample_size: Optional[int],
     random_state: int,
+    sampling_method: str = "diversity",
 ) -> tuple[SamplingReport, pd.DataFrame, pd.DataFrame]:
     log_stage("Loading dataset", path=data_path)
     df = load_dataset(data_path)
@@ -661,24 +738,23 @@ def run_pipeline(
         effective_sample_size = len(train_df)
     else:
         effective_sample_size = min(sample_size, len(train_df))
-    sampled_df, allocation_summary = stratified_diversity_sample(
+
+    sampled_df, allocation_summary = stratified_or_mi_sample(
         train_df,
         sample_size=effective_sample_size,
         random_state=random_state,
+        method=sampling_method,
     )
-    strata_kept = allocation_summary["allocated_sample"].astype(bool).sum()
+
+    strata_kept = allocation_summary.shape[0]
     log_stage(
         "Sampling completed",
         sample_size=len(sampled_df),
         strata=strata_kept,
         coverage=len(sampled_df) / len(train_df),
     )
-    sampled_df, membership_mi = mi_guided_refinement(
-        train_df,
-        sampled_df,
-        random_state=random_state,
-    )
-    log_stage("MI-guided refinement", bits=membership_mi)
+    membership_mi = _estimate_membership_mi(train_df, sampled_df.index)
+    log_stage("Membership MI estimated", bits=membership_mi)
     metrics_full, metrics_sample, class_report = evaluate_models(
         train_df,
         test_df,
@@ -788,6 +864,13 @@ def parse_args() -> argparse.Namespace:
         help="Random seed used across sampling/modeling.",
     )
     parser.add_argument(
+        "--sampling-method",
+        type=str,
+        choices=["diversity", "mi_proportional"],
+        default="diversity",
+        help="Sampling method to use: 'diversity' (original) or 'mi_proportional' (new).",
+    )
+    parser.add_argument(
         "--report-path",
         type=Path,
         default=Path("sampling_report.md"),
@@ -814,6 +897,7 @@ def main() -> None:
         data_path=args.data_path,
         sample_size=args.sample_size,
         random_state=args.random_state,
+        sampling_method=args.sampling_method,
     )
     write_report(report, args.report_path)
     log_stage("Report written", path=args.report_path)

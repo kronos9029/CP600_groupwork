@@ -2,7 +2,7 @@
 
 - Total records: 32561
 - Sample size: 5000
-- Membership MI (bits): 0.3984
+- Membership MI (bits): 0.3971
 - Non-empty strata: 294
 
 ## Model Performance (Full vs Sample)
@@ -10,19 +10,19 @@
 | --- | --- | --- |
 | accuracy | 0.804 | 0.805 |
 | precision | 0.674 | 0.711 |
-| recall | 0.362 | 0.323 |
-| f1 | 0.471 | 0.444 |
-| roc_auc | 0.827 | 0.825 |
+| recall | 0.362 | 0.320 |
+| f1 | 0.471 | 0.441 |
+| roc_auc | 0.827 | 0.824 |
 
 ## Distribution Drift (Total Variation Distance)
        feature  total_variation
      workclass         0.001200
     occupation         0.001382
-           age         0.029661
+           age         0.029861
   capital_gain         0.052252
-        fnlwgt         0.107127
-  capital_loss         0.112125
-hours_per_week         0.197615
+        fnlwgt         0.107527
+  capital_loss         0.111725
+hours_per_week         0.197015
 
 ## Strata Allocation (top 15 by size)
                             stratum  group_size  allocated_sample
@@ -55,11 +55,11 @@ hours_per_week         0.197615
 ```
               precision    recall  f1-score   support
 
-       <=50K      0.817     0.958     0.882      4945
-        >50K      0.711     0.323     0.444      1568
+       <=50K      0.816     0.959     0.882      4945
+        >50K      0.711     0.320     0.441      1568
 
     accuracy                          0.805      6513
-   macro avg      0.764     0.641     0.663      6513
-weighted avg      0.791     0.805     0.777      6513
+   macro avg      0.763     0.639     0.661      6513
+weighted avg      0.791     0.805     0.776      6513
 
 ```
