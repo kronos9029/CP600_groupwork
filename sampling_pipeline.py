@@ -570,23 +570,30 @@ def _plot_numeric_distribution(
     column: str,
     output_dir: Path,
 ) -> Path:
-    bins = min(20, max(5, full_series.nunique()))
+    num_bins = min(20, max(5, full_series.nunique()))
     fig, ax = plt.subplots(figsize=(8, 4))
+    common_range = (
+        min(full_series.min(), sample_series.min()),
+        max(full_series.max(), sample_series.max()),
+    )
+    bins = np.linspace(common_range[0], common_range[1], num_bins)
     ax.hist(
         full_series,
         bins=bins,
-        alpha=0.6,
+        alpha=0.5,
         density=True,
         label="Original",
         color="#1f77b4",
+        edgecolor="#1f77b4",
     )
     ax.hist(
         sample_series,
         bins=bins,
-        alpha=0.6,
+        alpha=0.5,
         density=True,
         label="Sample",
         color="#ff7f0e",
+        edgecolor="#ff7f0e",
     )
     ax.set_xlabel(column)
     ax.set_ylabel("Density")
@@ -608,10 +615,15 @@ def _plot_categorical_distribution(
     full_counts = full_series.value_counts(normalize=True)
     sample_counts = sample_series.value_counts(normalize=True)
     categories = full_counts.index.union(sample_counts.index)
+    # Preserve frequency order while appending unseen categories at the end
+    for cat in sample_counts.index:
+        if cat not in categories:
+            categories = categories.append(pd.Index([cat]))
+    categories = list(categories)
     full_values = full_counts.reindex(categories, fill_value=0).to_numpy()
     sample_values = sample_counts.reindex(categories, fill_value=0).to_numpy()
     positions = np.arange(len(categories))
-    width = 0.4
+    width = 0.35
     fig, ax = plt.subplots(figsize=(max(8, len(categories) * 0.5), 4))
     ax.bar(
         positions - width / 2,
@@ -619,6 +631,8 @@ def _plot_categorical_distribution(
         width,
         label="Original",
         color="#1f77b4",
+        alpha=0.85,
+        edgecolor="black",
     )
     ax.bar(
         positions + width / 2,
@@ -626,11 +640,18 @@ def _plot_categorical_distribution(
         width,
         label="Sample",
         color="#ff7f0e",
+        alpha=0.85,
+        edgecolor="black",
     )
     ax.set_xticks(positions)
     ax.set_xticklabels([str(cat) for cat in categories], rotation=45, ha="right")
     ax.set_ylabel("Proportion")
     ax.set_title(f"{column} distribution")
+    max_height = max(
+        float(full_values.max()) if len(full_values) else 0.0,
+        float(sample_values.max()) if len(sample_values) else 0.0,
+    )
+    ax.set_ylim(0, max(0.05, max_height * 1.15))
     ax.legend()
     fig.tight_layout()
     path = output_dir / f"{column}_distribution.png"
@@ -663,6 +684,8 @@ def create_distribution_plots(
 
 def create_model_diagnostics(
     artifacts: EvaluationArtifacts,
+    metrics_full: dict[str, float],
+    metrics_sample: dict[str, float],
     output_dir: Path,
 ) -> list[Path]:
     """Generate ROC curves and confusion matrix visuals."""
@@ -671,13 +694,30 @@ def create_model_diagnostics(
     y_true_binary = (artifacts.y_test == ">50K").astype(int)
     # ROC curves
     fig, ax = plt.subplots(figsize=(6, 4))
-    for label, proba, color in [
-        ("Full Data", artifacts.proba_full, "#1f77b4"),
-        ("Sample", artifacts.proba_sample, "#ff7f0e"),
-    ]:
+    curve_specs = [
+        (
+            "Full Data",
+            artifacts.proba_full,
+            metrics_full.get("roc_auc", float("nan")),
+            metrics_full.get("accuracy", float("nan")),
+            "#1f77b4",
+        ),
+        (
+            "Sample",
+            artifacts.proba_sample,
+            metrics_sample.get("roc_auc", float("nan")),
+            metrics_sample.get("accuracy", float("nan")),
+            "#ff7f0e",
+        ),
+    ]
+    for label, proba, auc_val, acc_val, color in curve_specs:
         fpr, tpr, _ = roc_curve(y_true_binary, proba)
-        auc_value = roc_auc_score(y_true_binary, proba)
-        ax.plot(fpr, tpr, label=f"{label} (AUC={auc_value:.3f})", color=color)
+        ax.plot(
+            fpr,
+            tpr,
+            label=f"{label} (AUC={auc_val:.3f}, ACC={acc_val:.3f})",
+            color=color,
+        )
     ax.plot([0, 1], [0, 1], "--", color="gray")
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
@@ -718,6 +758,10 @@ def plot_mi_convergence(history: Sequence[tuple[int, float]], output_path: Path)
     ax.set_ylabel("Membership MI (bits)")
     ax.set_title("MI-Guided Refinement Progress")
     ax.grid(True, linestyle="--", alpha=0.4)
+    start = int(min(iterations))
+    stop = int(max(iterations)) + 1
+    step = max(1, len(iterations) // 10)
+    ax.set_xticks(range(start, stop, step))
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
@@ -936,6 +980,8 @@ def main() -> None:
         log_stage("Figures generated", count=len(generated), directory=args.figures_dir)
     diag_paths = create_model_diagnostics(
         eval_artifacts,
+        report.metrics_full,
+        report.metrics_sample,
         output_dir=args.figures_dir,
     )
     if diag_paths:
