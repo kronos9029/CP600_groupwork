@@ -25,10 +25,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
+    ConfusionMatrixDisplay,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -108,6 +111,16 @@ class SamplingReport:
     classification_summary: str
     used_full_training_set: bool = False
     membership_mi: float = float("nan")
+
+
+@dataclass
+class EvaluationArtifacts:
+    y_test: pd.Series
+    proba_full: np.ndarray
+    proba_sample: np.ndarray
+    pred_full: np.ndarray
+    pred_sample: np.ndarray
+    classes: np.ndarray
 
 
 def load_dataset(path: Path) -> pd.DataFrame:
@@ -361,7 +374,7 @@ def evaluate_models(
     test_df: pd.DataFrame,
     sample_df: pd.DataFrame,
     feature_cols: Sequence[str],
-) -> tuple[dict[str, float], dict[str, float], str]:
+) -> tuple[dict[str, float], dict[str, float], str, EvaluationArtifacts]:
     """Fit and compare classifiers trained on the full vs sampled data."""
     pipeline = build_pipeline(feature_cols)
     full_model = pipeline.fit(train_df[feature_cols], train_df[TARGET_COLUMN])
@@ -392,7 +405,15 @@ def evaluate_models(
         sample_model.predict(X_test),
         digits=3,
     )
-    return metrics_full, metrics_sample, class_report
+    artifacts = EvaluationArtifacts(
+        y_test=y_test.reset_index(drop=True),
+        proba_full=proba_full,
+        proba_sample=proba_sample,
+        pred_full=full_model.predict(X_test),
+        pred_sample=sample_model.predict(X_test),
+        classes=sample_model.classes_,
+    )
+    return metrics_full, metrics_sample, class_report, artifacts
 
 
 def feature_distribution_drift(
@@ -490,13 +511,13 @@ def mi_guided_refinement(
     initial_sample: pd.DataFrame,
     random_state: int,
     max_iter: int = 30,
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, float, list[tuple[int, float]]]:
     """
     Iteratively swap records within strata to directly minimize membership MI.
     """
     rng = np.random.default_rng(random_state)
     if initial_sample.empty:
-        return initial_sample, 0.0
+        return initial_sample, 0.0, []
     discretized = add_discretized_columns(full_df)
     strata_cols = ["age_bin", "workclass", "occupation"]
     discretized["stratum_key"] = (
@@ -509,7 +530,8 @@ def mi_guided_refinement(
     selected: set[int] = set(map(int, initial_sample.index.tolist()))
     best_indices = list(selected)
     best_mi = _estimate_membership_mi(full_df, best_indices)
-    for _ in range(max_iter):
+    history: list[tuple[int, float]] = [(0, best_mi)]
+    for step in range(1, max_iter + 1):
         eligible = [
             key
             for key, idxs in stratum_groups.items()
@@ -533,12 +555,13 @@ def mi_guided_refinement(
             selected = trial_selected
             best_indices = trial_indices
             best_mi = trial_mi
+        history.append((step, best_mi))
     refined_df = full_df.loc[best_indices].copy()
     refined_df = refined_df.sample(
         frac=1,
         random_state=int(rng.integers(0, 1_000_000)),
     )
-    return refined_df, best_mi
+    return refined_df, best_mi, history
 
 
 def _plot_numeric_distribution(
@@ -638,11 +661,80 @@ def create_distribution_plots(
     return generated_paths
 
 
+def create_model_diagnostics(
+    artifacts: EvaluationArtifacts,
+    output_dir: Path,
+) -> list[Path]:
+    """Generate ROC curves and confusion matrix visuals."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generated: list[Path] = []
+    y_true_binary = (artifacts.y_test == ">50K").astype(int)
+    # ROC curves
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for label, proba, color in [
+        ("Full Data", artifacts.proba_full, "#1f77b4"),
+        ("Sample", artifacts.proba_sample, "#ff7f0e"),
+    ]:
+        fpr, tpr, _ = roc_curve(y_true_binary, proba)
+        auc_value = roc_auc_score(y_true_binary, proba)
+        ax.plot(fpr, tpr, label=f"{label} (AUC={auc_value:.3f})", color=color)
+    ax.plot([0, 1], [0, 1], "--", color="gray")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curves")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    roc_path = output_dir / "roc_curves.png"
+    fig.savefig(roc_path, dpi=300)
+    plt.close(fig)
+    generated.append(roc_path)
+    # Confusion matrix (sample model)
+    cm = confusion_matrix(
+        artifacts.y_test,
+        artifacts.pred_sample,
+        labels=artifacts.classes,
+    )
+    fig, ax = plt.subplots(figsize=(5, 4))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=artifacts.classes)
+    disp.plot(ax=ax, cmap="Blues", colorbar=True)
+    ax.set_title("Confusion Matrix (Sample Model)")
+    fig.tight_layout()
+    cm_path = output_dir / "confusion_matrix.png"
+    fig.savefig(cm_path, dpi=300)
+    plt.close(fig)
+    generated.append(cm_path)
+    return generated
+
+
+def plot_mi_convergence(history: Sequence[tuple[int, float]], output_path: Path) -> Path:
+    """Plot MI value across refinement iterations."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not history:
+        return output_path
+    iterations, values = zip(*history)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(iterations, values, marker="o", color="#2ca02c")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Membership MI (bits)")
+    ax.set_title("MI-Guided Refinement Progress")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
+
+
 def run_pipeline(
     data_path: Path,
     sample_size: Optional[int],
     random_state: int,
-) -> tuple[SamplingReport, pd.DataFrame, pd.DataFrame]:
+) -> tuple[
+    SamplingReport,
+    pd.DataFrame,
+    pd.DataFrame,
+    EvaluationArtifacts,
+    list[tuple[int, float]],
+]:
     log_stage("Loading dataset", path=data_path)
     df = load_dataset(data_path)
     df = fill_missing_values(df)
@@ -673,13 +765,13 @@ def run_pipeline(
         strata=strata_kept,
         coverage=len(sampled_df) / len(train_df),
     )
-    sampled_df, membership_mi = mi_guided_refinement(
+    sampled_df, membership_mi, mi_history = mi_guided_refinement(
         train_df,
         sampled_df,
         random_state=random_state,
     )
     log_stage("MI-guided refinement", bits=membership_mi)
-    metrics_full, metrics_sample, class_report = evaluate_models(
+    metrics_full, metrics_sample, class_report, eval_artifacts = evaluate_models(
         train_df,
         test_df,
         sampled_df,
@@ -713,7 +805,7 @@ def run_pipeline(
         used_full_training_set=(effective_sample_size == len(train_df)),
         membership_mi=membership_mi,
     )
-    return report, sampled_df, train_df
+    return report, sampled_df, train_df, eval_artifacts, mi_history
 
 
 def write_report(report: SamplingReport, output_path: Path) -> None:
@@ -810,7 +902,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    report, sampled_df, reference_df = run_pipeline(
+    (
+        report,
+        sampled_df,
+        reference_df,
+        eval_artifacts,
+        mi_history,
+    ) = run_pipeline(
         data_path=args.data_path,
         sample_size=args.sample_size,
         random_state=args.random_state,
@@ -836,6 +934,18 @@ def main() -> None:
     )
     if generated:
         log_stage("Figures generated", count=len(generated), directory=args.figures_dir)
+    diag_paths = create_model_diagnostics(
+        eval_artifacts,
+        output_dir=args.figures_dir,
+    )
+    if diag_paths:
+        log_stage("Model diagnostics saved", count=len(diag_paths))
+    mi_path = plot_mi_convergence(
+        mi_history,
+        output_path=args.figures_dir / "mi_convergence.png",
+    )
+    if mi_history:
+        log_stage("MI convergence plot written", path=mi_path)
 
 
 if __name__ == "__main__":
