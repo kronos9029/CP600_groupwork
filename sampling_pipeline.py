@@ -52,6 +52,7 @@ NON_SENSITIVE_COLUMNS = [
 
 TARGET_COLUMN = "income"
 
+# will set from user input when program start
 DEFAULT_SAMPLE_SIZE = 0
 
 AGE_BIN_EDGES = [16, 25, 35, 50, 65, 80, 100]
@@ -79,6 +80,7 @@ COMPLEXITY_INFO = {
 # i log pipeline stage here so friend can follow
 def log_stage(stage: str, **stats: object) -> None:
     """Print high-level stage markers with optional key/value stats."""
+    
     if stats:
         parts = []
         for key, value in stats.items():
@@ -132,6 +134,21 @@ def load_dataset(path: Path) -> pd.DataFrame:
         df[col] = df[col].str.strip()
     df = df.replace("?", pd.NA)
     return df
+
+
+# ask user sample size and clamp to limit
+def prompt_sample_size(max_entries: int) -> int:
+    """Read sample size from stdin and clamp to [0, max_entries]."""
+    try:
+        raw = input(
+            f"Enter sample size: (Note: sample size should be between 0 - {max_entries}) "
+        )
+        value = int(raw)
+    except Exception:
+        return max_entries
+    if value < 0 or value > max_entries:
+        return max_entries
+    return value
 
 
 # fill missing value simple
@@ -929,8 +946,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample-size",
         type=int,
-        default=DEFAULT_SAMPLE_SIZE,
-        help="Number of records to sample (m). Omit or <=0 to keep the full training set.",
+        default=None,
+        help="Number of records to sample (m). If omitted, will ask you on start.",
     )
     parser.add_argument(
         "--random-state",
@@ -962,6 +979,13 @@ def parse_args() -> argparse.Namespace:
 # program entry run pipeline and export stuff
 def main() -> None:
     args = parse_args()
+    df_for_bounds = load_dataset(args.data_path)
+    max_entries = len(df_for_bounds)
+    global DEFAULT_SAMPLE_SIZE
+    DEFAULT_SAMPLE_SIZE = prompt_sample_size(max_entries)
+    chosen_sample_size = args.sample_size if args.sample_size is not None else DEFAULT_SAMPLE_SIZE
+    if chosen_sample_size < 0 or chosen_sample_size > max_entries:
+        chosen_sample_size = max_entries
     (
         report,
         sampled_df,
@@ -970,7 +994,7 @@ def main() -> None:
         mi_history,
     ) = run_pipeline(
         data_path=args.data_path,
-        sample_size=args.sample_size,
+        sample_size=chosen_sample_size,
         random_state=args.random_state,
     )
     write_report(report, args.report_path)
