@@ -1,11 +1,3 @@
-"""
-Sampling and evaluation pipeline for the Adult Census Income dataset.
-
-The script implements the stratified + diversity-preserving sampling approach
-described in Step_2_Sampling_Algorithm_Design.docx and evaluates the downstream
-impact on a simple classifier compared to training on the full dataset.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -37,7 +29,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# Columns derived from Dataset Overview.docx (sensitive vs non-sensitive)
+# Columns derived from Dataset (sensitive vs non-sensitive)
 SENSITIVE_COLUMNS = {
     "education",
     "education_num",
@@ -84,6 +76,7 @@ COMPLEXITY_INFO = {
 }
 
 
+# i log pipeline stage here so friend can follow
 def log_stage(stage: str, **stats: object) -> None:
     """Print high-level stage markers with optional key/value stats."""
     if stats:
@@ -123,6 +116,7 @@ class EvaluationArtifacts:
     classes: np.ndarray
 
 
+# load adult csv and clean columns
 def load_dataset(path: Path) -> pd.DataFrame:
     """Load Adult CSV and normalize column names/values."""
     df = pd.read_csv(path, skipinitialspace=True, na_values="?", encoding="utf-8")
@@ -140,6 +134,7 @@ def load_dataset(path: Path) -> pd.DataFrame:
     return df
 
 
+# fill missing value simple
 def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     """Replace missing values with simple, privacy-preserving defaults."""
     result = df.copy()
@@ -154,6 +149,7 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+# make bins for nums so next stratify easy
 def add_discretized_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Add binned views of numeric features used for stratification."""
     result = df.copy()
@@ -197,6 +193,7 @@ def add_discretized_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+# make dataframe to markdown string even if library missing
 def dataframe_to_markdown(df: pd.DataFrame, **kwargs) -> str:
     """Render DataFrame to markdown, falling back to plain text if needed."""
     try:
@@ -205,6 +202,7 @@ def dataframe_to_markdown(df: pd.DataFrame, **kwargs) -> str:
         return df.to_string(index=kwargs.get("index", True))
 
 
+# normalize matrix columns to compare distance fair
 def _normalize_matrix(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
     """Standardize columns and replace NaNs for diversity computation."""
     col_means = np.nanmean(matrix, axis=0)
@@ -216,6 +214,7 @@ def _normalize_matrix(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.nan_to_num(matrix)
 
 
+# pick spread out rows inside one group using greedy
 def _diversity_sample(
     group: pd.DataFrame,
     take: int,
@@ -251,13 +250,14 @@ def _diversity_sample(
     return group.iloc[chosen]
 
 
+# do proportional stratified pick then keep diverse inside each stratum
 def stratified_diversity_sample(
     df: pd.DataFrame,
     sample_size: int,
     random_state: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Pick a representative sample from df using stratified proportional allocation
+    We pick a representative sample from df using stratified proportional allocation
     followed by intra-stratum diversity maximization.
     Returns the sampled rows and a summary of the allocation.
     """
@@ -326,8 +326,9 @@ def stratified_diversity_sample(
     return sampled, allocation_summary
 
 
+# build preprocessing and logistic model for features
 def build_pipeline(features: Sequence[str]) -> Pipeline:
-    """Construct a preprocessing + logistic regression pipeline."""
+    """Building a preprocessing + logistic regression pipeline."""
     categorical = [col for col in features if col not in DIV_FINITE_FEATURES]
     numeric = [col for col in features if col in DIV_FINITE_FEATURES]
     transformers = []
@@ -369,6 +370,7 @@ def build_pipeline(features: Sequence[str]) -> Pipeline:
     return Pipeline(steps=[("preprocessor", preprocessor), ("model", clf)])
 
 
+# train full vs sample model then measure metrics
 def evaluate_models(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -416,6 +418,7 @@ def evaluate_models(
     return metrics_full, metrics_sample, class_report, artifacts
 
 
+# check how sample distribution drift from full per feature
 def feature_distribution_drift(
     full_df: pd.DataFrame,
     sample_df: pd.DataFrame,
@@ -443,6 +446,7 @@ def feature_distribution_drift(
     return pd.DataFrame(rows).sort_values("total_variation")
 
 
+# bin fnlwgt value so MI calc not explode
 def _add_fnlwgt_bins(df: pd.DataFrame, bins: int = 10) -> pd.Series:
     """Create discrete bins for fnlwgt to enable MI calculation."""
     try:
@@ -451,6 +455,7 @@ def _add_fnlwgt_bins(df: pd.DataFrame, bins: int = 10) -> pd.Series:
         return pd.cut(df["fnlwgt"], bins=bins, labels=False, include_lowest=True)
 
 
+# estimate membership mutual info using discretize columns
 def _estimate_membership_mi(
     df: pd.DataFrame,
     sampled_indices: Sequence[int],
@@ -471,10 +476,11 @@ def _estimate_membership_mi(
         "loss_bin",
     ]
     for column in mi_columns:
-        discrete[column] = discrete[column].astype(str)
+            discrete[column] = discrete[column].astype(str)
     return _mutual_information_discrete(discrete, mi_columns, "in_sample")
 
 
+# compute MI between feature combo and membership flag
 def _mutual_information_discrete(
     df: pd.DataFrame,
     feature_cols: Sequence[str],
@@ -506,15 +512,14 @@ def _mutual_information_discrete(
     return float(mi)
 
 
+# swap rows inside strata to push MI lower step by step
 def mi_guided_refinement(
     full_df: pd.DataFrame,
     initial_sample: pd.DataFrame,
     random_state: int,
     max_iter: int = 30,
 ) -> tuple[pd.DataFrame, float, list[tuple[int, float]]]:
-    """
-    Iteratively swap records within strata to directly minimize membership MI.
-    """
+    """Iteratively swap records within strata to directly minimize membership MI."""
     rng = np.random.default_rng(random_state)
     if initial_sample.empty:
         return initial_sample, 0.0, []
@@ -564,6 +569,7 @@ def mi_guided_refinement(
     return refined_df, best_mi, history
 
 
+# draw histogram compare numeric column full vs sample
 def _plot_numeric_distribution(
     full_series: pd.Series,
     sample_series: pd.Series,
@@ -606,6 +612,9 @@ def _plot_numeric_distribution(
     return path
 
 
+# For data visualization
+# To be added in the report
+# draw bar chart compare category share full vs sample
 def _plot_categorical_distribution(
     full_series: pd.Series,
     sample_series: pd.Series,
@@ -660,6 +669,7 @@ def _plot_categorical_distribution(
     return path
 
 
+# create set of compare plots for chosen columns
 def create_distribution_plots(
     full_df: pd.DataFrame,
     sample_df: pd.DataFrame,
@@ -682,6 +692,7 @@ def create_distribution_plots(
     return generated_paths
 
 
+# save ROC and confusion matrix to see model behavior
 def create_model_diagnostics(
     artifacts: EvaluationArtifacts,
     metrics_full: dict[str, float],
@@ -746,6 +757,7 @@ def create_model_diagnostics(
     return generated
 
 
+# plot how MI change across refinement loop
 def plot_mi_convergence(history: Sequence[tuple[int, float]], output_path: Path) -> Path:
     """Plot MI value across refinement iterations."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -768,6 +780,7 @@ def plot_mi_convergence(history: Sequence[tuple[int, float]], output_path: Path)
     return output_path
 
 
+# main pipeline wire: load, sample, train, evaluate
 def run_pipeline(
     data_path: Path,
     sample_size: Optional[int],
@@ -852,6 +865,7 @@ def run_pipeline(
     return report, sampled_df, train_df, eval_artifacts, mi_history
 
 
+# write markdown report of sampling result
 def write_report(report: SamplingReport, output_path: Path) -> None:
     """Persist a human-readable summary."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -901,6 +915,7 @@ def write_report(report: SamplingReport, output_path: Path) -> None:
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# parse user cli options for pipeline run
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Representative sampling + evaluation for Adult dataset.",
@@ -944,6 +959,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# program entry run pipeline and export stuff
 def main() -> None:
     args = parse_args()
     (
